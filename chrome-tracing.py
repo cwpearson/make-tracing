@@ -5,105 +5,156 @@
 import sys
 import re
 import json
+import math
+
+class Span:
+    def __init__(self, start, pid, cmd):
+        self.start = start #us
+        self.pid = pid
+        self.cmd = cmd
+        self.stop = None
+
+    def is_open(self):
+        return self.stop is None
+
+    def get_name(self):
+        mo = re.match(".*nvcc_wrapper.*/(.*?\.cpp)", self.cmd)
+        if mo:
+            return mo.group(1)
+        else:
+            return ""
+
+    def get_cat(self):
+        mo = re.match(".*nvcc_wrapper.*/(.*?\.cpp)", self.cmd)
+        if mo:
+            return "cpp"
+        else:
+            return "cmd"
+
+
+    def b_event(self):
+        return {
+            "name": self.get_name(),
+            "cat": self.get_cat(),
+            "ph": "B",
+            "ts": self.start,
+            "pid": 0,
+            "tid": self.pid,
+            "args": {"cmd": self.cmd},
+        }
+
+    def e_event(self):
+        return {
+            "name": self.get_name(),
+            "cat": self.get_cat(),
+            "ph": "E",
+            "ts": self.stop,
+            "pid": 0,
+            "tid": self.pid,
+            "args": {},
+        }
+
+    def sort_event(self, sort_index):
+        return {
+            "name": "thread_sort_index",
+            "ph": "M",
+            "pid": 0,
+            "tid": self.pid,
+            "args": {"sort_index": sort_index},
+        }
+
 
 with open(sys.argv[1], "r") as f:
     lines = f.readlines()
 
-f = open("events.out", "w")
 
-objs = []
+
+open_spans = set()
+closed_spans = []
 
 for line in lines:
-    mo = re.match("(\d+) \[(.*)\] (\d+)", line) # start of a command
+    mo = re.match("B (\d+) (\d+\.\d+) \[(.*)\]", line) # start of a command
     if mo:
-        pid = mo.group(1)
-        cmd = mo.group(2)
-        ts = mo.group(3)
+        pid = int(mo.group(1))
+        ts = float(mo.group(2)) * 1000000 # microseconds
+        cmd = mo.group(3)
 
-        mo = re.match(".*nvcc_wrapper.*/(.*?\.cpp)", cmd)
-        if mo:
-            name = mo.group(1)
-            cat = "cpp"
-        else:
-            name = ""
-            cat = "cmd"
+        open_spans.add(Span(ts, pid, cmd))
+        print(len(open_spans), "open spans")
 
-        obj = {
-            "name": name,
-            "cat": cat,
-            "ph": "B",
-            "ts": ts,
-            "pid": 0,
-            "tid": pid,
-            "args": {"cmd": cmd},
-        }
-        objs += [obj]
-
-    mo = re.match("(\d+) (\d+)", line) # end of a command
+    mo = re.match("E (\d+) (\d+\.\d+)", line) # end of a command
     if mo:
-        pid = mo.group(1)
-        ts = mo.group(2)
+        pid = int(mo.group(1))
+        ts = float(mo.group(2)) * 1000000 # microseconds
 
-        obj = {
-            "name": "",
-            "cat": "",
-            "ph": "E",
-            "ts": ts,
-            "pid": 0,
-            "tid": pid,
-            "args": {},
-        }
-        objs += [obj]
-
-# remove all without ends
-i = 0
-while i < len(objs):
-    if objs[i]["ph"] == 'B':
-        found_end = False
-        for j in range(i+1, len(objs)):
-            if objs[i]["tid"] == objs[j]["tid"] and objs[j]["ph"] == 'E':
-                found_end = True
+        for span in open_spans:
+            if span.pid == pid:
+                open_spans.remove(span)
+                span.stop = ts
+                closed_spans += [span]
                 break
-        if not found_end:
-            print("didn't find end to ", i, objs[i])
-            objs = objs[:i] + objs[i+1:]
-            i -= 1
-    i += 1
+        print(len(open_spans), "open spans")
+        print(len(closed_spans), "closed spans")
 
-# remove all length < 2
+spans = sorted(closed_spans, key=lambda s: s.start)
+
+# remove small
 i = 0
-while i < len(objs):
-    if objs[i]["ph"] == 'B':
-        for j in range(i+1, len(objs)):
-            if objs[i]["tid"] == objs[j]["tid"] and objs[j]["ph"] == 'E':
-                if int(objs[j]["ts"]) - int(objs[i]["ts"]) < 2:
-                    print(i, j, "length <2")
-                    objs = objs[:j] + objs[j+1:]
-                    objs = objs[:i] + objs[i+1:]
-                    i -= 1
-                    break
+while i < len(spans):
+    elapsed = spans[i].stop - spans[i].start
+    if elapsed < 1000000:
+        spans = spans[:i] + spans[i+1:]
+        i -= 1
     i += 1
 
+print(len(spans), "long spans")
 
-# sort by timestamp in viewer
-objs = sorted(objs, key=lambda o: o["ts"])
+obj = {
+    "traceEvents": [],
+    "displayTimeUnit": "ms",
+}
 
+for i, span in enumerate(spans):
+    obj["traceEvents"] += [span.b_event()]
+    obj["traceEvents"] += [span.e_event()]
+    obj["traceEvents"] += [span.sort_event(i)]
 
-meta_objs = []
-tsi = 0
-for o in objs:
-    if o["ph"] == 'B':
-        meta_objs += [
-            {
-                "name": "thread_sort_index",
-                "ph": "M",
-                "pid": o["pid"],
-                "tid": o["tid"],
-                "args": {"sort_index": tsi},
-            }
-        ]
-        tsi += 1
+with open(sys.argv[2], "w") as f:
+    f.write(json.dumps(obj))
 
-objs = objs + meta_objs
+# print build parallelism vs time
+start_ts = min(span.start for span in spans)
+stop_ts = max(span.stop for span in spans)
+parallelism_x = []
+parallelism_y = []
+i = start_ts
+while i < stop_ts:
+    count = 0
+    for span in spans:
+        if i >= span.start and i < span.stop and "cpp" == span.get_cat():
+            count += 1
 
-f.write(json.dumps(objs))
+    parallelism_x += [int((i - start_ts) / 1000000)]
+    parallelism_y += [count]
+
+    i += 1000000
+
+# print csv
+for xy in zip(parallelism_x, parallelism_y):
+    print str(xy[0]) + "," + str(xy[1])
+
+# histogram compile times
+min_elapsed = min(span.stop - span.start for span in spans if span.get_cat() == "cpp")
+max_elapsed = max(span.stop - span.start for span in spans if span.get_cat() == "cpp")
+nBins = 20
+bins = [0 for x in range(nBins)]
+for span in spans:
+    if span.get_cat() == "cpp":
+        elapsed = span.stop - span.start
+        iBin = (elapsed - min_elapsed) / (max_elapsed - min_elapsed) * nBins
+        print elapsed, min_elapsed, max_elapsed, max_elapsed - min_elapsed, iBin
+        iBin = int(iBin)
+        iBin = min(iBin, nBins-1)
+        bins[iBin] += 1
+
+print bins
